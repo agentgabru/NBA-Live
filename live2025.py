@@ -66,7 +66,7 @@ def print_mobile(df):
         print(f"  Proj   " + colored(f"{cur} {arrow}", color, attrs=["bold"]) + f"  (season {sea})")
         print(f"  PPM    {r['_currPPM']} now · {r['_seasonPPM']} avg")
         if r["BET"]:
-            print(colored(f"  {r['BET']}  ·  conf {r['Confidence']}", "red", attrs=["bold"]))
+            print(colored(f"  {r['BET']}", "red", attrs=["bold"]))
 
 
 import os
@@ -90,17 +90,13 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 # ── Under tiers ───────────────────────────────────────────────────
 # gap  = current-pace projection − season-pace projection
 # lead = absolute score difference (must be >= MIN_LEAD for any tier)
-#   Lean   💡  gap >= 5   (3rd and 4th quarter only)
-#   Strong 🔻  gap >= 10  (any time)
-#   Smash  💥  gap >= 15  (any time)
+#   Lean       gap >= 5   (3rd quarter)
+#   Strong     gap >= 5 in the 4th quarter, or gap >= 10 any time
+#   SMASH 💥   gap >= 15  (any time)
 MIN_LEAD = 12
 TIER_RANK = {"Info": 0, "Lean": 1, "Strong": 2, "Smash": 3}
-TIER_EMOJI = {"Info": "📊", "Lean": "💡", "Strong": "🔻", "Smash": "💥"}
+TIER_LABEL = {"Info": "📊 UPDATE (test)", "Lean": "Lean", "Strong": "Strong", "Smash": "SMASH 💥"}
 TIER_COLOR = {"Info": 0x95A5A6, "Lean": 0xF1C40F, "Strong": 0xE67E22, "Smash": 0xE03C31}
-
-
-def label(tier):
-    return "UPDATE (test)" if tier == "Info" else f"UNDER {tier.upper()}"
 
 
 def under_tier(gap, lead, period):
@@ -108,9 +104,9 @@ def under_tier(gap, lead, period):
         return ""
     if gap >= 15:
         return "Smash"
-    if gap >= 10:
+    if gap >= 10 or (gap >= 5 and period == 4):
         return "Strong"
-    if gap >= 5 and period in (3, 4):
+    if gap >= 5 and period == 3:
         return "Lean"
     return ""
 
@@ -126,7 +122,7 @@ except (OSError, ValueError):
     alerted_games = {}
 
 
-def send_discord_alert(game_id, tier, away, home, clock, mins_left, total, cur_proj, season_proj, lead, gap, confidence):
+def send_discord_alert(game_id, tier, away, home, clock, mins_left, total, cur_proj, season_proj, lead, gap):
     """Post to Discord when a game first reaches a tier, or upgrades to a higher one."""
     prev = alerted_games.get(game_id)
     if not DISCORD_WEBHOOK_URL:
@@ -136,7 +132,7 @@ def send_discord_alert(game_id, tier, away, home, clock, mins_left, total, cur_p
     payload = {
         "username": "NBA Live",
         "embeds": [{
-            "title": f"{TIER_EMOJI[tier]} {label(tier)} — {away} @ {home}",
+            "title": f"UNDER {TIER_LABEL[tier]} — {away} @ {home}" if tier != "Info" else f"{TIER_LABEL[tier]} — {away} @ {home}",
             "description": f"Upgraded from {prev}" if prev and not ALERT_ALL else None,
             "color": TIER_COLOR[tier],
             "fields": [
@@ -145,7 +141,6 @@ def send_discord_alert(game_id, tier, away, home, clock, mins_left, total, cur_p
                 {"name": "Lead", "value": str(lead), "inline": True},
                 {"name": "Gap", "value": f"{gap:+d}", "inline": True},
                 {"name": "Proj (curr / season)", "value": f"{cur_proj} / {season_proj}", "inline": True},
-                {"name": "Confidence", "value": str(confidence), "inline": True},
             ],
             "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
         }],
@@ -214,17 +209,15 @@ while True:
         if ALERT_ALL and not tier:
             tier = "Info"
         if tier:
-            under_indicator = f"{TIER_EMOJI[tier]} {label(tier)}"
-            confidence = min(100, round((projected_diff + score_diff) / 2, 1))
+            under_indicator = TIER_LABEL[tier] if tier == "Info" else f"UNDER · {TIER_LABEL[tier]}"
             send_discord_alert(
                 game_id, tier,
                 f"{awayTeamName} {awayTeamCurrentTotal}", f"{homeTeamName} {homeTeamCurrentTotal}",
                 game_clock_label(boxScore['period'], minutes, seconds), minRemaining,
-                gameTotal, currProjectedTotal, seasonProjectedTotal, score_diff, projected_diff, confidence,
+                gameTotal, currProjectedTotal, seasonProjectedTotal, score_diff, projected_diff,
             )
         else:
             under_indicator = ""
-            confidence = ""
 
         # 🆕 Updated Matchup field to include scores
         matchup_display = f"{awayTeamName} ({awayTeamCurrentTotal}) vs {homeTeamName} ({homeTeamCurrentTotal})"
@@ -238,7 +231,6 @@ while True:
             "Current Total": gameTotal,
             "PPM (Season : Curr)": f"{round(gameSeasonPPM, 2)} : {currPPM}",
             "BET": under_indicator,
-            "Confidence": confidence,
             # extra fields for the mobile card view
             "_away": f"{awayTeamName} {awayTeamCurrentTotal}",
             "_home": f"{homeTeamName} {homeTeamCurrentTotal}",
