@@ -87,7 +87,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 # ── Under tiers ───────────────────────────────────────────────────
 # gap  = current-pace projection − season-pace projection
 # lead = absolute score difference (must be >= MIN_LEAD for any tier)
-#   Lean   💡  gap >= 5   (3rd quarter only)
+#   Lean   💡  gap >= 5   (3rd and 4th quarter only)
 #   Strong 🔻  gap >= 10  (any time)
 #   Smash  💥  gap >= 15  (any time)
 MIN_LEAD = 12
@@ -103,7 +103,7 @@ def under_tier(gap, lead, period):
         return "Smash"
     if gap >= 10:
         return "Strong"
-    if gap >= 5 and period == 3:
+    if gap >= 5 and period in (3, 4):
         return "Lean"
     return ""
 
