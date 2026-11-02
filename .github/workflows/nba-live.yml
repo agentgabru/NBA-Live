@@ -1,0 +1,60 @@
+name: NBA Live alerts
+
+# Three daily starts (cron is UTC; times below are Eastern Standard Time, +1h during EDT).
+# Each run waits for tip-off if it's within its time budget, runs until every game is
+# final or ~5h45m pass, then exits. Runs that have nothing to do exit in about a minute.
+on:
+  schedule:
+    - cron: "45 16 * * *"   # 11:45 AM ET  - weekend / holiday afternoon games
+    - cron: "30 22 * * *"   #  5:30 PM ET  - evening slate
+    - cron: "15 4 * * *"    # 11:15 PM ET  - late West Coast games
+  workflow_dispatch: {}      # "Run workflow" button for manual runs / testing
+
+# Never run two at once; a new start waits for the previous one to finish.
+concurrency:
+  group: nba-live
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      PYTHONUNBUFFERED: "1"
+      MAX_RUNTIME_MIN: "345"
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Remember which games already alerted, across runs (no duplicate Discord posts)
+      - name: Restore alert history
+        uses: actions/cache/restore@v4
+        with:
+          path: .alerted_games.json
+          key: alerted-${{ github.run_id }}
+          restore-keys: alerted-
+
+      - name: Refresh season team averages
+        run: |
+          python fetch_team_avgs.py || echo "::warning::ESPN fetch failed - using committed 2025teamdata.csv"
+          [ -f .alerted_games.json ] || echo '{}' > .alerted_games.json
+
+      - name: Watch live games
+        run: python live2025.py --auto
+
+      - name: Save alert history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .alerted_games.json
+          key: alerted-${{ github.run_id }}
