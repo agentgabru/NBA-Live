@@ -28,6 +28,44 @@ def colorize_projection(row):
     else:
         return colored(gp, "yellow")
 
+import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# Default output is a narrow card per game (fits a phone screen).
+# Run with --wide for the original desktop table.
+WIDE = "--wide" in sys.argv
+
+
+def game_clock_label(period, minutes, seconds):
+    """'Q3 4:07', 'HALF', 'END Q1', or 'OT1 2:10'."""
+    if minutes == 0 and seconds == 0:
+        return "HALF" if period == 2 else f"END Q{period}" if period <= 4 else f"END OT{period - 4}"
+    q = f"Q{period}" if period <= 4 else f"OT{period - 4}"
+    return f"{q} {minutes}:{seconds:02d}"
+
+
+def print_mobile(df):
+    """One compact card per game, ~32 chars wide."""
+    print(colored(f"🏀 LIVE  {datetime.now(ZoneInfo('America/New_York')):%-I:%M %p} ET", attrs=["bold"]))
+    for _, r in df.iterrows():
+        cur, sea = r["Current Proj"], r["Season Proj"]
+        if cur > sea:
+            arrow, color = "▲", "green"
+        elif cur < sea:
+            arrow, color = "▼", "red"
+        else:
+            arrow, color = "=", "yellow"
+        print()
+        print(colored(f"{r['_away']} @ {r['_home']}", attrs=["bold"]))
+        print(f"  {r['_clock']}  ·  {r['Mins Left']:.1f}m left")
+        print(f"  Total  {r['Current Total']}")
+        print(f"  Proj   " + colored(f"{cur} {arrow}", color, attrs=["bold"]) + f"  (season {sea})")
+        print(f"  PPM    {r['_currPPM']} now · {r['_seasonPPM']} avg")
+        if r["BET"]:
+            print(colored(f"  🔻 UNDER  ·  conf {r['Confidence']}", "red", attrs=["bold"]))
+
+
 while True:
     board = scoreboard.ScoreBoard()
     games = board.games.get_dict()
@@ -90,7 +128,13 @@ while True:
             "Current Total": gameTotal,
             "PPM (Season : Curr)": f"{round(gameSeasonPPM, 2)} : {currPPM}",
             "BET": under_indicator,
-            "Confidence": confidence
+            "Confidence": confidence,
+            # extra fields for the mobile card view
+            "_away": f"{awayTeamName} {awayTeamCurrentTotal}",
+            "_home": f"{homeTeamName} {homeTeamCurrentTotal}",
+            "_clock": game_clock_label(boxScore['period'], minutes, seconds),
+            "_seasonPPM": round(gameSeasonPPM, 2),
+            "_currPPM": currPPM,
         })
 
     # Convert to DataFrame
@@ -100,16 +144,19 @@ while True:
         # Sort by minutes remaining (soonest ending first)
         results_df = results_df.sort_values(by="Mins Left")
 
-        # Colorize Game Projected column
-        results_df["Current Proj"] = results_df.apply(colorize_projection, axis=1)
-
-        # Print as Markdown-style table
-        print(tabulate(results_df, headers="keys", tablefmt="github", showindex=False))
+        if WIDE:
+            # Original desktop table
+            results_df["Current Proj"] = results_df.apply(colorize_projection, axis=1)
+            table_df = results_df[[c for c in results_df.columns if not c.startswith("_")]]
+            print(tabulate(table_df, headers="keys", tablefmt="github", showindex=False))
+        else:
+            print_mobile(results_df)
     else:
         print("No live games currently in progress.")
 
-    print("\n" + "*" * 140)
-    print("\n" + "*" * 140)
-    print("\n" + "*" * 140 + "\n")
+    if WIDE:
+        print("\n" + "*" * 140 + "\n")
+    else:
+        print(colored("─" * 32, "dark_grey") + "\n")
 
     time.sleep(30)
