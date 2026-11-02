@@ -63,7 +63,7 @@ def print_mobile(df):
         print(f"  Proj   " + colored(f"{cur} {arrow}", color, attrs=["bold"]) + f"  (season {sea})")
         print(f"  PPM    {r['_currPPM']} now · {r['_seasonPPM']} avg")
         if r["BET"]:
-            print(colored(f"  🔻 UNDER  ·  conf {r['Confidence']}", "red", attrs=["bold"]))
+            print(colored(f"  {r['BET']}  ·  conf {r['Confidence']}", "red", attrs=["bold"]))
 
 
 import os
@@ -84,39 +84,71 @@ def _load_dotenv(path=".env"):
 
 _load_dotenv()
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-ALERTED_FILE = ".alerted_games.json"  # survives restarts, so each game alerts once
+# ── Under tiers ───────────────────────────────────────────────────
+# gap  = current-pace projection − season-pace projection
+# lead = absolute score difference (must be >= MIN_LEAD for any tier)
+#   Lean   💡  gap >= 5   (3rd quarter only)
+#   Strong 🔻  gap >= 10  (any time)
+#   Smash  💥  gap >= 15  (any time)
+MIN_LEAD = 12
+TIER_RANK = {"Lean": 1, "Strong": 2, "Smash": 3}
+TIER_EMOJI = {"Lean": "💡", "Strong": "🔻", "Smash": "💥"}
+TIER_COLOR = {"Lean": 0xF1C40F, "Strong": 0xE67E22, "Smash": 0xE03C31}
+
+
+def under_tier(gap, lead, period):
+    if lead < MIN_LEAD:
+        return ""
+    if gap >= 15:
+        return "Smash"
+    if gap >= 10:
+        return "Strong"
+    if gap >= 5 and period == 3:
+        return "Lean"
+    return ""
+
+
+# game_id -> highest tier already alerted; survives restarts.
+# A game re-alerts only when it upgrades (Lean -> Strong -> Smash).
+ALERTED_FILE = ".alerted_games.json"
 try:
-    alerted_games = set(json.load(open(ALERTED_FILE)))
+    alerted_games = json.load(open(ALERTED_FILE))
+    if not isinstance(alerted_games, dict):  # old format: list of ids
+        alerted_games = {g: "Strong" for g in alerted_games}
 except (OSError, ValueError):
-    alerted_games = set()
+    alerted_games = {}
 
 
-def send_discord_alert(game_id, away, home, clock, mins_left, total, cur_proj, season_proj, lead, confidence):
-    """Post an UNDER alert to Discord the first time a game qualifies."""
-    if not DISCORD_WEBHOOK_URL or game_id in alerted_games:
+def send_discord_alert(game_id, tier, away, home, clock, mins_left, total, cur_proj, season_proj, lead, gap, confidence):
+    """Post to Discord when a game first reaches a tier, or upgrades to a higher one."""
+    prev = alerted_games.get(game_id)
+    if not DISCORD_WEBHOOK_URL or (prev and TIER_RANK[tier] <= TIER_RANK[prev]):
         return
     payload = {
         "username": "NBA Live",
         "embeds": [{
-            "title": f"🔻 UNDER CANDIDATE — {away} @ {home}",
-            "color": 0xE03C31,
+            "title": f"{TIER_EMOJI[tier]} UNDER {tier.upper()} — {away} @ {home}",
+            "description": f"Upgraded from {prev}" if prev else None,
+            "color": TIER_COLOR[tier],
             "fields": [
                 {"name": "Clock", "value": f"{clock} ({mins_left:.1f}m left)", "inline": True},
                 {"name": "Total", "value": str(total), "inline": True},
                 {"name": "Lead", "value": str(lead), "inline": True},
-                {"name": "Current Proj", "value": str(cur_proj), "inline": True},
-                {"name": "Season Proj", "value": str(season_proj), "inline": True},
+                {"name": "Gap", "value": f"+{gap}", "inline": True},
+                {"name": "Proj (curr / season)", "value": f"{cur_proj} / {season_proj}", "inline": True},
                 {"name": "Confidence", "value": str(confidence), "inline": True},
             ],
             "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
         }],
     }
+    if not prev:
+        del payload["embeds"][0]["description"]
     try:
         r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
         r.raise_for_status()
-        alerted_games.add(game_id)
-        json.dump(sorted(alerted_games), open(ALERTED_FILE, "w"))
-        print(colored(f"📣 Discord alert sent: {away} @ {home}", "magenta"))
+        alerted_games[game_id] = tier
+        json.dump(alerted_games, open(ALERTED_FILE, "w"))
+        print(colored(f"📣 Discord alert sent: {tier} — {away} @ {home}", "magenta"))
     except requests.RequestException as e:
         print(colored(f"⚠️  Discord alert failed: {e}", "yellow"))
 
@@ -167,15 +199,16 @@ while True:
         projected_diff = currProjectedTotal - seasonProjectedTotal
         score_diff = abs(homeTeamCurrentTotal - awayTeamCurrentTotal)
 
-        # Base criteria for "Under"
-        if projected_diff > 10 and score_diff > 15:
-            under_indicator = "🔻 UNDER CANDIDATE"
+        # Under tiers (lead must be >= MIN_LEAD for any tier)
+        tier = under_tier(projected_diff, score_diff, boxScore['period'])
+        if tier:
+            under_indicator = f"{TIER_EMOJI[tier]} UNDER {tier.upper()}"
             confidence = min(100, round((projected_diff + score_diff) / 2, 1))
             send_discord_alert(
-                game_id,
+                game_id, tier,
                 f"{awayTeamName} {awayTeamCurrentTotal}", f"{homeTeamName} {homeTeamCurrentTotal}",
                 game_clock_label(boxScore['period'], minutes, seconds), minRemaining,
-                gameTotal, currProjectedTotal, seasonProjectedTotal, score_diff, confidence,
+                gameTotal, currProjectedTotal, seasonProjectedTotal, score_diff, projected_diff, confidence,
             )
         else:
             under_indicator = ""
