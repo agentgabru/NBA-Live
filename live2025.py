@@ -28,6 +28,7 @@ def colorize_projection(row):
     else:
         return colored(gp, "yellow")
 
+import os
 import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -38,6 +39,11 @@ WIDE = "--wide" in sys.argv
 # TEMP test mode: --alert-all ignores lead/gap filters and posts every live game
 # to Discord on every refresh (no de-duplication).
 ALERT_ALL = "--alert-all" in sys.argv
+# Unattended mode (GitHub Actions): wait for the first tip-off, exit when every
+# game today is final or after MAX_RUNTIME_MIN minutes (job time limit).
+AUTO = "--auto" in sys.argv
+START_TIME = time.time()
+MAX_RUNTIME_MIN = float(os.environ.get("MAX_RUNTIME_MIN", "345"))
 
 
 def game_clock_label(period, minutes, seconds):
@@ -162,14 +168,55 @@ if not DISCORD_WEBHOOK_URL:
     print(colored("ℹ️  DISCORD_WEBHOOK_URL not set — Discord alerts off", "yellow"))
 
 
+def auto_wait_seconds(games):
+    """--auto: None to keep polling now, a number of seconds to sleep, or -1 to exit."""
+    if (time.time() - START_TIME) / 60 >= MAX_RUNTIME_MIN:
+        print(f"⏱️  Reached {MAX_RUNTIME_MIN:.0f} min run limit — exiting (next scheduled run continues).")
+        return -1
+    if not games:
+        print("No NBA games on today's scoreboard — exiting.")
+        return -1
+    if all(g["gameStatus"] == 3 for g in games):
+        print("All of today's games are final — exiting.")
+        return -1
+    if any(g["gameStatus"] == 2 for g in games):
+        return None
+    # Nothing live yet: sleep until the next scheduled tip (re-check at least every 5 min)
+    now = datetime.now(ZoneInfo("UTC"))
+    starts = [datetime.fromisoformat(g["gameTimeUTC"].replace("Z", "+00:00"))
+              for g in games if g["gameStatus"] == 1 and g.get("gameTimeUTC")]
+    nxt = min(starts) if starts else now
+    remaining = MAX_RUNTIME_MIN * 60 - (time.time() - START_TIME)
+    if (nxt - now).total_seconds() > remaining:
+        print(f"Next tip-off ({nxt.astimezone(ZoneInfo('America/New_York')):%-I:%M %p} ET) is after this run's time limit — exiting (a later scheduled run will cover it).")
+        return -1
+    wait = max(30, min(300, (nxt - now).total_seconds()))
+    print(f"Waiting for tip-off ({nxt.astimezone(ZoneInfo('America/New_York')):%-I:%M %p} ET) — checking again in {wait/60:.1f} min")
+    return wait
+
+
 while True:
-    board = scoreboard.ScoreBoard()
-    games = board.games.get_dict()
+    try:
+        games = scoreboard.ScoreBoard().games.get_dict()
+    except Exception as e:  # network blip: retry instead of crashing
+        print(colored(f"⚠️  Scoreboard fetch failed: {e}", "yellow"))
+        time.sleep(30)
+        continue
+
+    if AUTO:
+        wait = auto_wait_seconds(games)
+        if wait == -1:
+            break
+        if wait:
+            time.sleep(wait)
+            continue
+
     filtered_games = [game for game in games if game["gameStatus"] == 2]  # only live games
 
     game_rows = []
 
     for game in filtered_games:
+      try:
         game_id = game['gameId']
         homeTeamName = game['homeTeam']['teamTricode']
         awayTeamName = game['awayTeam']['teamTricode']
@@ -238,6 +285,8 @@ while True:
             "_seasonPPM": round(gameSeasonPPM, 2),
             "_currPPM": currPPM,
         })
+      except Exception as e:  # e.g. blank clock between periods: skip this game this cycle
+        print(colored(f"⚠️  Skipped {game.get('gameId')}: {e}", "yellow"))
 
     # Convert to DataFrame
     results_df = pd.DataFrame(game_rows)
