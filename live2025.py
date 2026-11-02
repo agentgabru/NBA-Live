@@ -66,6 +66,65 @@ def print_mobile(df):
             print(colored(f"  🔻 UNDER  ·  conf {r['Confidence']}", "red", attrs=["bold"]))
 
 
+import os
+import json
+import requests
+
+
+# ── Discord alerts ────────────────────────────────────────────────
+# Set DISCORD_WEBHOOK_URL in the environment or in a local .env file
+# (.env is gitignored — never commit the webhook URL).
+def _load_dotenv(path=".env"):
+    if os.path.exists(path):
+        for line in open(path):
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.strip().split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"\''))
+
+
+_load_dotenv()
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+ALERTED_FILE = ".alerted_games.json"  # survives restarts, so each game alerts once
+try:
+    alerted_games = set(json.load(open(ALERTED_FILE)))
+except (OSError, ValueError):
+    alerted_games = set()
+
+
+def send_discord_alert(game_id, away, home, clock, mins_left, total, cur_proj, season_proj, lead, confidence):
+    """Post an UNDER alert to Discord the first time a game qualifies."""
+    if not DISCORD_WEBHOOK_URL or game_id in alerted_games:
+        return
+    payload = {
+        "username": "NBA Live",
+        "embeds": [{
+            "title": f"🔻 UNDER CANDIDATE — {away} @ {home}",
+            "color": 0xE03C31,
+            "fields": [
+                {"name": "Clock", "value": f"{clock} ({mins_left:.1f}m left)", "inline": True},
+                {"name": "Total", "value": str(total), "inline": True},
+                {"name": "Lead", "value": str(lead), "inline": True},
+                {"name": "Current Proj", "value": str(cur_proj), "inline": True},
+                {"name": "Season Proj", "value": str(season_proj), "inline": True},
+                {"name": "Confidence", "value": str(confidence), "inline": True},
+            ],
+            "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
+        }],
+    }
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        r.raise_for_status()
+        alerted_games.add(game_id)
+        json.dump(sorted(alerted_games), open(ALERTED_FILE, "w"))
+        print(colored(f"📣 Discord alert sent: {away} @ {home}", "magenta"))
+    except requests.RequestException as e:
+        print(colored(f"⚠️  Discord alert failed: {e}", "yellow"))
+
+
+if not DISCORD_WEBHOOK_URL:
+    print(colored("ℹ️  DISCORD_WEBHOOK_URL not set — Discord alerts off", "yellow"))
+
+
 while True:
     board = scoreboard.ScoreBoard()
     games = board.games.get_dict()
@@ -112,6 +171,12 @@ while True:
         if projected_diff > 10 and score_diff > 15:
             under_indicator = "🔻 UNDER CANDIDATE"
             confidence = min(100, round((projected_diff + score_diff) / 2, 1))
+            send_discord_alert(
+                game_id,
+                f"{awayTeamName} {awayTeamCurrentTotal}", f"{homeTeamName} {homeTeamCurrentTotal}",
+                game_clock_label(boxScore['period'], minutes, seconds), minRemaining,
+                gameTotal, currProjectedTotal, seasonProjectedTotal, score_diff, confidence,
+            )
         else:
             under_indicator = ""
             confidence = ""
