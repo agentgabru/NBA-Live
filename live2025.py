@@ -35,6 +35,9 @@ from zoneinfo import ZoneInfo
 # Default output is a narrow card per game (fits a phone screen).
 # Run with --wide for the original desktop table.
 WIDE = "--wide" in sys.argv
+# TEMP test mode: --alert-all ignores lead/gap filters and posts every live game
+# to Discord on every refresh (no de-duplication).
+ALERT_ALL = "--alert-all" in sys.argv
 
 
 def game_clock_label(period, minutes, seconds):
@@ -91,9 +94,13 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 #   Strong 🔻  gap >= 10  (any time)
 #   Smash  💥  gap >= 15  (any time)
 MIN_LEAD = 12
-TIER_RANK = {"Lean": 1, "Strong": 2, "Smash": 3}
-TIER_EMOJI = {"Lean": "💡", "Strong": "🔻", "Smash": "💥"}
-TIER_COLOR = {"Lean": 0xF1C40F, "Strong": 0xE67E22, "Smash": 0xE03C31}
+TIER_RANK = {"Info": 0, "Lean": 1, "Strong": 2, "Smash": 3}
+TIER_EMOJI = {"Info": "📊", "Lean": "💡", "Strong": "🔻", "Smash": "💥"}
+TIER_COLOR = {"Info": 0x95A5A6, "Lean": 0xF1C40F, "Strong": 0xE67E22, "Smash": 0xE03C31}
+
+
+def label(tier):
+    return "UPDATE (test)" if tier == "Info" else f"UNDER {tier.upper()}"
 
 
 def under_tier(gap, lead, period):
@@ -122,31 +129,34 @@ except (OSError, ValueError):
 def send_discord_alert(game_id, tier, away, home, clock, mins_left, total, cur_proj, season_proj, lead, gap, confidence):
     """Post to Discord when a game first reaches a tier, or upgrades to a higher one."""
     prev = alerted_games.get(game_id)
-    if not DISCORD_WEBHOOK_URL or (prev and TIER_RANK[tier] <= TIER_RANK[prev]):
+    if not DISCORD_WEBHOOK_URL:
+        return
+    if not ALERT_ALL and prev and TIER_RANK[tier] <= TIER_RANK[prev]:
         return
     payload = {
         "username": "NBA Live",
         "embeds": [{
-            "title": f"{TIER_EMOJI[tier]} UNDER {tier.upper()} — {away} @ {home}",
-            "description": f"Upgraded from {prev}" if prev else None,
+            "title": f"{TIER_EMOJI[tier]} {label(tier)} — {away} @ {home}",
+            "description": f"Upgraded from {prev}" if prev and not ALERT_ALL else None,
             "color": TIER_COLOR[tier],
             "fields": [
                 {"name": "Clock", "value": f"{clock} ({mins_left:.1f}m left)", "inline": True},
                 {"name": "Total", "value": str(total), "inline": True},
                 {"name": "Lead", "value": str(lead), "inline": True},
-                {"name": "Gap", "value": f"+{gap}", "inline": True},
+                {"name": "Gap", "value": f"{gap:+d}", "inline": True},
                 {"name": "Proj (curr / season)", "value": f"{cur_proj} / {season_proj}", "inline": True},
                 {"name": "Confidence", "value": str(confidence), "inline": True},
             ],
             "timestamp": datetime.now(ZoneInfo("UTC")).isoformat(),
         }],
     }
-    if not prev:
+    if not payload["embeds"][0]["description"]:
         del payload["embeds"][0]["description"]
     try:
         r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
         r.raise_for_status()
-        alerted_games[game_id] = tier
+        if not ALERT_ALL:  # test mode must not affect real de-duplication
+            alerted_games[game_id] = tier
         json.dump(alerted_games, open(ALERTED_FILE, "w"))
         print(colored(f"📣 Discord alert sent: {tier} — {away} @ {home}", "magenta"))
     except requests.RequestException as e:
@@ -201,8 +211,10 @@ while True:
 
         # Under tiers (lead must be >= MIN_LEAD for any tier)
         tier = under_tier(projected_diff, score_diff, boxScore['period'])
+        if ALERT_ALL and not tier:
+            tier = "Info"
         if tier:
-            under_indicator = f"{TIER_EMOJI[tier]} UNDER {tier.upper()}"
+            under_indicator = f"{TIER_EMOJI[tier]} {label(tier)}"
             confidence = min(100, round((projected_diff + score_diff) / 2, 1))
             send_discord_alert(
                 game_id, tier,
