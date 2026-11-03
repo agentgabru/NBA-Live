@@ -35,8 +35,8 @@ from zoneinfo import ZoneInfo
 # Default output is a narrow card per game (fits a phone screen).
 # Run with --wide for the original desktop table.
 WIDE = "--wide" in sys.argv
-# TEMP test mode: --alert-all ignores lead/gap filters and posts every live game
-# to Discord on every refresh (no de-duplication).
+# TEMP test mode: --alert-all ignores the win%/gap/window filters and posts every
+# live game to Discord on every refresh (no de-duplication).
 ALERT_ALL = "--alert-all" in sys.argv
 
 
@@ -65,6 +65,8 @@ def print_mobile(df):
         print(f"  Total  {r['Current Total']}")
         print(f"  Proj   " + colored(f"{cur} {arrow}", color, attrs=["bold"]) + f"  (season {sea})")
         print(f"  PPM    {r['_currPPM']} now · {r['_seasonPPM']} avg")
+        if r["_winPct"] is not None:
+            print(f"  Win    {r['_winPct']:.0%}")
         if r["BET"]:
             print(colored(f"  {r['BET']}", "red", attrs=["bold"]))
 
@@ -88,27 +90,87 @@ def _load_dotenv(path=".env"):
 _load_dotenv()
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 # ── Under tiers ───────────────────────────────────────────────────
-# gap  = current-pace projection − season-pace projection
-# lead = absolute score difference (must be >= MIN_LEAD for any tier)
-#   Lean       gap >= 5   (3rd quarter)
-#   Strong     gap >= 5 in the 4th quarter, or gap >= 10 any time
-#   SMASH 💥   gap >= 15  (any time)
-MIN_LEAD = 12
+# A game qualifies only when the leading team is a clear favorite
+# (win% >= MIN_WIN_PCT) AND we're in the end-game window:
+#   - 3rd or 4th quarter only (never Q1/Q2 or OT)
+#   - in the 4th, stop once fewer than Q4_CUTOFF_MIN minutes remain
+# Given those gates, the GAP (how far the live pace projects above the
+# season-pace baseline) decides the tier:
+#   Lean       gap >= 5
+#   Strong     gap >= 8
+#   SMASH 💥   gap >= 12
+MIN_WIN_PCT = 0.88      # leading team's ESPN live win probability
+Q4_CUTOFF_MIN = 5       # no new alerts inside the last 5 min of Q4
+GAP_TIERS = [("Smash", 12), ("Strong", 8), ("Lean", 5)]  # checked high -> low
 TIER_RANK = {"Info": 0, "Lean": 1, "Strong": 2, "Smash": 3}
 TIER_LABEL = {"Info": "📊 UPDATE (test)", "Lean": "Lean", "Strong": "Strong", "Smash": "SMASH 💥"}
 TIER_COLOR = {"Info": 0x95A5A6, "Lean": 0xF1C40F, "Strong": 0xE67E22, "Smash": 0xE03C31}
 
 
-def under_tier(gap, lead, period):
-    if lead < MIN_LEAD:
+def under_tier(gap, win_pct, period, min_remaining):
+    """Return '', 'Lean', 'Strong', or 'Smash'."""
+    if period not in (3, 4):                       # Q3/Q4 only
         return ""
-    if gap >= 15:
-        return "Smash"
-    if gap >= 10 or (gap >= 5 and period == 4):
-        return "Strong"
-    if gap >= 5 and period == 3:
-        return "Lean"
+    if period == 4 and min_remaining < Q4_CUTOFF_MIN:
+        return ""
+    if win_pct is None or win_pct < MIN_WIN_PCT:   # must be a decided game
+        return ""
+    for name, threshold in GAP_TIERS:
+        if gap >= threshold:
+            return name
     return ""
+
+
+# ── Live win probability (ESPN) ───────────────────────────────────
+# nba_api has no win probability, so we match each live game to its ESPN
+# event by team tricodes and read ESPN's live model. Reuses the fetch
+# script's abbreviation fixups so ESPN tricodes line up with nba_api's.
+ESPN_FIX = {"GS": "GSW", "NO": "NOP", "NY": "NYK", "SA": "SAS", "UTAH": "UTA", "WSH": "WAS"}
+ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
+
+
+def espn_event_map():
+    """{frozenset(away_tri, home_tri): (event_id, home_tri)} for today's games."""
+    out = {}
+    try:
+        events = requests.get(ESPN_SCOREBOARD, timeout=10).json().get("events", [])
+    except Exception as e:
+        print(colored(f"⚠️  ESPN scoreboard fetch failed: {e}", "yellow"))
+        return out
+    for e in events:
+        try:
+            comp = e["competitions"][0]["competitors"]
+            tri = {c["homeAway"]: ESPN_FIX.get(c["team"]["abbreviation"], c["team"]["abbreviation"])
+                   for c in comp}
+            out[frozenset((tri["home"], tri["away"]))] = (e["id"], tri["home"])
+        except (KeyError, IndexError):
+            continue
+    return out
+
+
+def leading_team_win_pct(away_tri, away_score, home_tri, home_score, event_map):
+    """ESPN live win% for whichever team is currently ahead, or None."""
+    hit = event_map.get(frozenset((away_tri, home_tri)))
+    if not hit:
+        return None
+    event_id, espn_home = hit
+    try:
+        wp = requests.get(ESPN_SUMMARY, params={"event": event_id}, timeout=10).json().get("winprobability", [])
+        if not wp:
+            return None
+        last = wp[-1]
+        home_pct = last.get("homeWinPercentage")
+        tie = last.get("tiePercentage") or 0
+        if home_pct is None:
+            return None
+    except Exception:
+        return None
+    # winprobability is keyed to ESPN's home team; align to our home tricode
+    if espn_home != home_tri:
+        home_pct = 1 - home_pct - tie
+    away_pct = 1 - home_pct - tie
+    return home_pct if home_score >= away_score else away_pct
 
 
 # game_id -> highest tier already alerted; survives restarts.
@@ -122,7 +184,7 @@ except (OSError, ValueError):
     alerted_games = {}
 
 
-def send_discord_alert(game_id, tier, away, home, clock, mins_left, total, cur_proj, season_proj, lead, gap):
+def send_discord_alert(game_id, tier, away, home, clock, mins_left, total, cur_proj, season_proj, win_pct, gap):
     """Post to Discord when a game first reaches a tier, or upgrades to a higher one."""
     prev = alerted_games.get(game_id)
     if not DISCORD_WEBHOOK_URL:
@@ -138,7 +200,7 @@ def send_discord_alert(game_id, tier, away, home, clock, mins_left, total, cur_p
             "fields": [
                 {"name": "Clock", "value": f"{clock} ({mins_left:.1f}m left)", "inline": True},
                 {"name": "Total", "value": str(total), "inline": True},
-                {"name": "Lead", "value": str(lead), "inline": True},
+                {"name": "Win%", "value": f"{win_pct:.0%}" if win_pct is not None else "—", "inline": True},
                 {"name": "Gap", "value": f"{gap:+d}", "inline": True},
                 {"name": "Proj (curr / season)", "value": f"{cur_proj} / {season_proj}", "inline": True},
             ],
@@ -162,11 +224,26 @@ if not DISCORD_WEBHOOK_URL:
     print(colored("ℹ️  DISCORD_WEBHOOK_URL not set — Discord alerts off", "yellow"))
 
 
+HAS_DEFENSE = "Allowed" in allTeamsDF.columns
+if not HAS_DEFENSE:
+    print(colored("ℹ️  2025teamdata.csv has no 'Allowed' column — run fetch_team_avgs.py "
+                  "for defense-adjusted projections (using points scored only for now)", "yellow"))
+
+
+def expected_ppg(team_df, opp_df):
+    """Blend a team's scoring with the opponent's defense (points allowed)."""
+    scored = team_df['Score'].iloc[0]
+    if HAS_DEFENSE:
+        return (scored + opp_df['Allowed'].iloc[0]) / 2
+    return scored
+
+
 while True:
     board = scoreboard.ScoreBoard()
     games = board.games.get_dict()
     filtered_games = [game for game in games if game["gameStatus"] == 2]  # only live games
 
+    event_map = espn_event_map() if filtered_games else {}
     game_rows = []
 
     for game in filtered_games:
@@ -174,11 +251,11 @@ while True:
         homeTeamName = game['homeTeam']['teamTricode']
         awayTeamName = game['awayTeam']['teamTricode']
 
-        # Fetch team averages
+        # Fetch team averages (offense blended with opponent's defense)
         homeTeamDF = allTeamsDF[allTeamsDF['Team'] == homeTeamName]
         awayTeamDF = allTeamsDF[allTeamsDF['Team'] == awayTeamName]
-        homeAvgSeasonPPM = homeTeamDF['Score'].iloc[0] / 48
-        awayAvgSeasonPPM = awayTeamDF['Score'].iloc[0] / 48
+        homeAvgSeasonPPM = expected_ppg(homeTeamDF, awayTeamDF) / 48
+        awayAvgSeasonPPM = expected_ppg(awayTeamDF, homeTeamDF) / 48
         gameSeasonPPM = homeAvgSeasonPPM + awayAvgSeasonPPM
 
         # Live box score
@@ -202,10 +279,19 @@ while True:
 
         # 🧮 Under Bet Logic
         projected_diff = currProjectedTotal - seasonProjectedTotal
-        score_diff = abs(homeTeamCurrentTotal - awayTeamCurrentTotal)
+        period = boxScore['period']
 
-        # Under tiers (lead must be >= MIN_LEAD for any tier)
-        tier = under_tier(projected_diff, score_diff, boxScore['period'])
+        # Win probability only matters in the Q3/Q4 window — skip the extra
+        # ESPN call (and the whole lookup) outside it.
+        in_window = period in (3, 4) and not (period == 4 and minRemaining < Q4_CUTOFF_MIN)
+        if in_window:
+            winPct = leading_team_win_pct(
+                awayTeamName, awayTeamCurrentTotal, homeTeamName, homeTeamCurrentTotal, event_map
+            )
+        else:
+            winPct = None
+
+        tier = under_tier(projected_diff, winPct, period, minRemaining)
         if ALERT_ALL and not tier:
             tier = "Info"
         if tier:
@@ -213,8 +299,8 @@ while True:
             send_discord_alert(
                 game_id, tier,
                 f"{awayTeamName} {awayTeamCurrentTotal}", f"{homeTeamName} {homeTeamCurrentTotal}",
-                game_clock_label(boxScore['period'], minutes, seconds), minRemaining,
-                gameTotal, currProjectedTotal, seasonProjectedTotal, score_diff, projected_diff,
+                game_clock_label(period, minutes, seconds), minRemaining,
+                gameTotal, currProjectedTotal, seasonProjectedTotal, winPct, projected_diff,
             )
         else:
             under_indicator = ""
@@ -234,9 +320,10 @@ while True:
             # extra fields for the mobile card view
             "_away": f"{awayTeamName} {awayTeamCurrentTotal}",
             "_home": f"{homeTeamName} {homeTeamCurrentTotal}",
-            "_clock": game_clock_label(boxScore['period'], minutes, seconds),
+            "_clock": game_clock_label(period, minutes, seconds),
             "_seasonPPM": round(gameSeasonPPM, 2),
             "_currPPM": currPPM,
+            "_winPct": winPct,
         })
 
     # Convert to DataFrame
