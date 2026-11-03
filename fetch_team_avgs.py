@@ -1,4 +1,5 @@
-"""Build 2025teamdata.csv: current-season regular-season points per game per team.
+"""Build 2025teamdata.csv: current-season regular-season team averages.
+Columns: Team, Score (avg points scored), Allowed (avg points allowed), GP.
 Source: ESPN public scoreboard (stats.nba.com / NBA CDN schedule block cloud IPs)."""
 from datetime import date, timedelta
 import requests
@@ -17,13 +18,21 @@ while d <= today:
     for e in events:
         if e["season"]["type"] != 2 or not e["status"]["type"]["completed"]:
             continue  # regular season, final games only
-        for c in e["competitions"][0]["competitors"]:
-            ab = c["team"]["abbreviation"]
-            rows.append({"Team": FIX.get(ab, ab), "pts": int(c["score"])})
+        comp = e["competitions"][0]["competitors"]
+        if len(comp) != 2:
+            continue
+        pts = {c["team"]["abbreviation"]: int(c["score"]) for c in comp}
+        abs_ = list(pts)
+        for i, ab in enumerate(abs_):
+            opp = abs_[1 - i]
+            rows.append({"Team": FIX.get(ab, ab), "scored": pts[ab], "allowed": pts[opp]})
     d += timedelta(days=1)
 
-df = pd.DataFrame(rows).groupby("Team")["pts"].agg(Score="mean", GP="count").reset_index()
+df = (pd.DataFrame(rows).groupby("Team")
+      .agg(Score=("scored", "mean"), Allowed=("allowed", "mean"), GP=("scored", "count"))
+      .reset_index())
 df["Score"] = df["Score"].round(1)
+df["Allowed"] = df["Allowed"].round(1)
 df.to_csv("2025teamdata.csv", index=False)
 print(f"{len(df)} teams, {len(rows)//2} games")
 print(df.sort_values("Score", ascending=False).to_string(index=False))
