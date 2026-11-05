@@ -71,7 +71,7 @@ def print_mobile(df):
         print(f"  Total  {r['Current Total']}")
         print(f"  Proj   " + colored(f"{cur} {arrow}", color, attrs=["bold"]) + f"  (season {sea})")
         print(f"  PPM    {r['_currPPM']} now · {r['_seasonPPM']} avg")
-        if r["_winPct"] is not None:
+        if pd.notna(r["_winPct"]):
             print(f"  Win    {r['_winPct']:.0%}")
         if r["BET"]:
             print(colored(f"  {r['BET']}", "red", attrs=["bold"]))
